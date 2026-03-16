@@ -1,6 +1,7 @@
 """
 Ethereum Transaction Monitor - Telegram Bot
 Monitors the Ethereum blockchain and alerts on large transactions.
+Compatible with: web3>=7.0, python-telegram-bot>=21.5, Python 3.11+
 """
 
 import asyncio
@@ -16,8 +17,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-from web3 import Web3
-from web3.exceptions import BlockNotFound
+from web3 import AsyncWeb3
+from web3.providers import WebSocketProvider
 
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -84,8 +85,8 @@ def fetch_eth_price() -> float:
 
 # ── Alert Formatter ────────────────────────────────────────────────────────────
 def build_alert(tx: dict, eth_amount: Decimal, usd_value: float) -> str:
-    tx_hash = tx["hash"].hex()
-    sender = tx["from"]
+    tx_hash = tx["hash"].hex() if isinstance(tx["hash"], bytes) else tx["hash"]
+    sender = tx.get("from", "Unknown")
     receiver = tx.get("to") or "Contract Creation"
     return (
         f"🚨 *Large Ethereum Transaction Detected*\n\n"
@@ -100,68 +101,67 @@ def build_alert(tx: dict, eth_amount: Decimal, usd_value: float) -> str:
 # ── Blockchain Monitor ─────────────────────────────────────────────────────────
 async def monitor_blockchain(app: Application) -> None:
     """
-    Core monitoring loop.
-    Connects via WebSocket, subscribes to new blocks, scans transactions,
-    and sends Telegram alerts. Reconnects automatically on errors.
+    Core monitoring loop using web3.py v7 AsyncWeb3 + WebSocketProvider.
+    Subscribes to newHeads, scans each block's transactions, sends alerts.
+    Reconnects automatically with exponential back-off on any error.
     """
-    reconnect_delay = 5  # seconds, grows on repeated failures
+    reconnect_delay = 5
 
     while state.monitoring:
-        w3: Optional[Web3] = None
         try:
-            logger.info("Connecting to Ethereum node: %s", WEB3_WSS_ENDPOINT[:40] + "…")
-            w3 = Web3(Web3.WebsocketProvider(WEB3_WSS_ENDPOINT, websocket_timeout=60))
+            logger.info("Connecting to Ethereum node...")
 
-            if not w3.is_connected():
-                raise ConnectionError("Web3 provider not connected.")
+            async with AsyncWeb3(WebSocketProvider(WEB3_WSS_ENDPOINT)) as w3:
+                if not await w3.is_connected():
+                    raise ConnectionError("Web3 provider failed to connect.")
 
-            logger.info("Connected. Chain ID: %d", w3.eth.chain_id)
-            reconnect_delay = 5  # reset on successful connect
+                chain_id = await w3.eth.chain_id
+                logger.info("Connected. Chain ID: %d", chain_id)
+                reconnect_delay = 5  # reset on success
 
-            # Subscribe to new block headers
-            subscription = w3.eth.subscribe("newHeads")  # type: ignore[attr-defined]
+                # Subscribe to new block headers
+                async for block_header in await w3.eth.subscribe("newHeads"):
+                    if not state.monitoring:
+                        break
 
-            async for block_header in subscription:  # type: ignore[attr-defined]
-                if not state.monitoring:
-                    break
+                    block_number = block_header["number"]
+                    logger.info("New block: %d", block_number)
 
-                block_number = block_header["number"]
-                logger.info("New block: %d", block_number)
-
-                try:
-                    block = w3.eth.get_block(block_number, full_transactions=True)
-                except BlockNotFound:
-                    logger.warning("Block %d not found, skipping.", block_number)
-                    continue
-
-                eth_price = fetch_eth_price()
-                if eth_price == 0:
-                    logger.warning("ETH price unavailable; skipping block %d.", block_number)
-                    continue
-
-                state.blocks_scanned += 1
-
-                for tx in block.transactions:  # type: ignore[union-attr]
                     try:
-                        eth_amount = Decimal(tx["value"]) / Decimal(10**18)
-                        usd_value = float(eth_amount) * eth_price
+                        block = await w3.eth.get_block(block_number, full_transactions=True)
+                    except Exception as e:
+                        logger.warning("Could not fetch block %d: %s", block_number, e)
+                        continue
 
-                        if usd_value >= state.threshold_usd:
-                            alert_text = build_alert(tx, eth_amount, usd_value)
-                            await app.bot.send_message(
-                                chat_id=TELEGRAM_CHAT_ID,
-                                text=alert_text,
-                                parse_mode="Markdown",
-                                disable_web_page_preview=True,
-                            )
-                            state.alerts_sent += 1
-                            logger.info(
-                                "Alert sent — $%.2f | tx %s",
-                                usd_value,
-                                tx["hash"].hex()[:16] + "…",
-                            )
-                    except Exception as tx_err:
-                        logger.debug("Error processing tx: %s", tx_err)
+                    eth_price = fetch_eth_price()
+                    if eth_price == 0:
+                        logger.warning("ETH price unavailable; skipping block %d.", block_number)
+                        continue
+
+                    state.blocks_scanned += 1
+
+                    for tx in block.transactions:
+                        try:
+                            eth_amount = Decimal(tx["value"]) / Decimal(10**18)
+                            usd_value = float(eth_amount) * eth_price
+
+                            if usd_value >= state.threshold_usd:
+                                alert_text = build_alert(tx, eth_amount, usd_value)
+                                await app.bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=alert_text,
+                                    parse_mode="Markdown",
+                                    disable_web_page_preview=True,
+                                )
+                                state.alerts_sent += 1
+                                tx_hash = tx["hash"].hex() if isinstance(tx["hash"], bytes) else tx["hash"]
+                                logger.info(
+                                    "Alert sent -- $%.2f | tx %s...",
+                                    usd_value,
+                                    tx_hash[:16],
+                                )
+                        except Exception as tx_err:
+                            logger.debug("Error processing tx: %s", tx_err)
 
         except asyncio.CancelledError:
             logger.info("Monitor task cancelled.")
@@ -169,15 +169,11 @@ async def monitor_blockchain(app: Application) -> None:
         except Exception as exc:
             if not state.monitoring:
                 break
-            logger.error("Monitor error: %s — reconnecting in %ds", exc, reconnect_delay)
+            logger.error(
+                "Monitor error: %s -- reconnecting in %ds", exc, reconnect_delay
+            )
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 120)  # exponential back-off, cap 2 min
-        finally:
-            if w3 and hasattr(w3.provider, "disconnect"):
-                try:
-                    await w3.provider.disconnect()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+            reconnect_delay = min(reconnect_delay * 2, 120)
 
     logger.info("Monitoring stopped.")
 
@@ -185,36 +181,41 @@ async def monitor_blockchain(app: Application) -> None:
 # ── Telegram Commands ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if state.monitoring:
-        await update.message.reply_text("✅ Monitoring is already running.")
+        await update.message.reply_text("Already running.")
         return
 
     state.monitoring = True
     state.start_time = time.time()
     state.blocks_scanned = 0
     state.alerts_sent = 0
-    state.monitor_task = asyncio.create_task(monitor_blockchain(context.application))
+    state.monitor_task = asyncio.create_task(
+        monitor_blockchain(context.application)
+    )
 
     await update.message.reply_text(
-        f"🟢 *Ethereum monitor started!*\n"
-        f"Alert threshold: *${state.threshold_usd:,.0f} USD*\n\n"
+        f"Ethereum monitor started!\n"
+        f"Alert threshold: ${state.threshold_usd:,.0f} USD\n\n"
         f"Use /stop to halt monitoring.\n"
         f"Use /threshold to change the alert level.",
-        parse_mode="Markdown",
     )
     logger.info("Monitoring started by user %s.", update.effective_user.id)
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not state.monitoring:
-        await update.message.reply_text("⚠️ Monitor is not running.")
+        await update.message.reply_text("Monitor is not running.")
         return
 
     state.monitoring = False
     if state.monitor_task:
         state.monitor_task.cancel()
+        try:
+            await state.monitor_task
+        except asyncio.CancelledError:
+            pass
         state.monitor_task = None
 
-    await update.message.reply_text("🔴 Monitoring stopped.")
+    await update.message.reply_text("Monitoring stopped.")
     logger.info("Monitoring stopped by user %s.", update.effective_user.id)
 
 
@@ -222,9 +223,8 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args
     if not args:
         await update.message.reply_text(
-            f"Current threshold: *${state.threshold_usd:,.0f} USD*\n\n"
-            f"To change it, use:\n`/threshold 10000`",
-            parse_mode="Markdown",
+            f"Current threshold: ${state.threshold_usd:,.0f} USD\n\n"
+            f"To change it, use: /threshold 10000"
         )
         return
 
@@ -234,45 +234,45 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             raise ValueError("Threshold must be positive.")
         state.threshold_usd = new_val
         await update.message.reply_text(
-            f"✅ Threshold updated to *${state.threshold_usd:,.0f} USD*",
-            parse_mode="Markdown",
+            f"Threshold updated to ${state.threshold_usd:,.0f} USD"
         )
-        logger.info("Threshold changed to $%.2f by user %s.", new_val, update.effective_user.id)
+        logger.info(
+            "Threshold changed to $%.2f by user %s.",
+            new_val,
+            update.effective_user.id,
+        )
     except (ValueError, IndexError):
-        await update.message.reply_text("❌ Invalid value. Example: `/threshold 10000`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Invalid value. Example: /threshold 10000"
+        )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    status_icon = "🟢 Running" if state.monitoring else "🔴 Stopped"
+    status_icon = "Running" if state.monitoring else "Stopped"
     eth_price = fetch_eth_price()
 
-    uptime_str = "—"
+    uptime_str = "--"
     if state.monitoring and state.start_time:
         elapsed = int(time.time() - state.start_time)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
         uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
 
     await update.message.reply_text(
-        f"📊 *Bot Status*\n\n"
+        f"Bot Status\n\n"
         f"Status: {status_icon}\n"
-        f"Threshold: *${state.threshold_usd:,.0f} USD*\n"
-        f"ETH Price: *${eth_price:,.2f} USD*\n"
-        f"Blocks Scanned: *{state.blocks_scanned:,}*\n"
-        f"Alerts Sent: *{state.alerts_sent:,}*\n"
-        f"Uptime: *{uptime_str}*",
-        parse_mode="Markdown",
+        f"Threshold: ${state.threshold_usd:,.0f} USD\n"
+        f"ETH Price: ${eth_price:,.2f} USD\n"
+        f"Blocks Scanned: {state.blocks_scanned:,}\n"
+        f"Alerts Sent: {state.alerts_sent:,}\n"
+        f"Uptime: {uptime_str}"
     )
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
 def main() -> None:
-    logger.info("Starting Ethereum Monitor Bot…")
+    logger.info("Starting Ethereum Monitor Bot...")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
