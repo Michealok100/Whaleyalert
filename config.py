@@ -9,8 +9,8 @@ import os
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 # Get these from @BotFather (token) and your own account/group (chat_id).
-TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID: str   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_TELEGRAM_CHAT_ID_HERE")
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "8543090657:AAG6vCrohidjZ5U9y4VGrqhWO0OT0KmeALo")
+TELEGRAM_CHAT_ID: str   = os.getenv("TELEGRAM_CHAT_ID",   "6050518380")
 
 # ── Ethereum Node (WebSocket) ──────────────────────────────────────────────────
 # Infura:  wss://mainnet.infura.io/ws/v3/YOUR_PROJECT_ID
