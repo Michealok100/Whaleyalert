@@ -13,8 +13,8 @@ import time
 from decimal import Decimal
 from typing import Optional
 
-import requests
-from telegram import Update
+import httpx  # FIX #2: replaced blocking `requests` with async httpx
+from telegram import Update, LinkPreviewOptions  # FIX #4: import LinkPreviewOptions
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -85,12 +85,38 @@ state = BotState()
 
 
 # ── ETH Price ──────────────────────────────────────────────────────────────────
-def fetch_eth_price() -> float:
+# FIX #2: now fully async — no longer blocks the event loop
+async def fetch_eth_price() -> float:
     """Fetch ETH/USD price from CoinGecko with in-memory caching."""
     now = time.time()
     if now - state.eth_price_updated < ETH_PRICE_CACHE_SECONDS and state.eth_price_usd:
         return state.eth_price_usd
     try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                COINGECKO_API_URL,
+                params={"ids": "ethereum", "vs_currencies": "usd"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            price = float(resp.json()["ethereum"]["usd"])
+            state.eth_price_usd = price
+            state.eth_price_updated = now
+            logger.debug("ETH price refreshed: $%.2f", price)
+            return price
+    except Exception as exc:
+        logger.warning("Could not fetch ETH price: %s", exc)
+        return state.eth_price_usd or 0.0
+
+
+# Also expose a sync version for /status command (called outside the monitor loop)
+def fetch_eth_price_sync() -> float:
+    """Synchronous price fetch for use in Telegram command handlers."""
+    now = time.time()
+    if now - state.eth_price_updated < ETH_PRICE_CACHE_SECONDS and state.eth_price_usd:
+        return state.eth_price_usd
+    try:
+        import requests
         resp = requests.get(
             COINGECKO_API_URL,
             params={"ids": "ethereum", "vs_currencies": "usd"},
@@ -100,10 +126,9 @@ def fetch_eth_price() -> float:
         price = float(resp.json()["ethereum"]["usd"])
         state.eth_price_usd = price
         state.eth_price_updated = now
-        logger.debug("ETH price refreshed: $%.2f", price)
         return price
     except Exception as exc:
-        logger.warning("Could not fetch ETH price: %s", exc)
+        logger.warning("Could not fetch ETH price (sync): %s", exc)
         return state.eth_price_usd or 0.0
 
 
@@ -113,7 +138,7 @@ def build_alert(tx: dict, eth_amount: Decimal, usd_value: float) -> str:
     sender   = tx.get("from") or "Unknown"
     receiver = tx.get("to")   or "Contract Creation"
     return (
-        f"Large Ethereum Transaction Detected\n\n"
+        f"🚨 Large Ethereum Transaction Detected\n\n"
         f"Value: ${usd_value:,.2f}  |  Amount: {eth_amount:.6f} ETH\n"
         f"From: {sender}\n"
         f"To:   {receiver}\n"
@@ -127,7 +152,7 @@ async def monitor_blockchain(app: Application) -> None:
     """
     Core loop — web3.py v7 correct pattern:
       1. await w3.eth.subscribe("newHeads")  -> returns subscription ID string
-      2. async for response in w3.socket.process_subscriptions() -> yields block headers
+      2. async for response in w3.socket.process_subscriptions() -> yields subscription responses
     Auto-reconnects with exponential back-off on any error.
     """
     reconnect_delay = 5
@@ -144,22 +169,29 @@ async def monitor_blockchain(app: Application) -> None:
                 logger.info("Connected. Chain ID: %d", chain_id)
                 reconnect_delay = 5  # reset on success
 
-                # Step 1: subscribe — returns the subscription ID (a string), NOT an iterator
                 subscription_id = await w3.eth.subscribe("newHeads")
                 logger.info("Subscribed to newHeads. Sub ID: %s", subscription_id)
 
-                # Step 2: iterate — w3.socket.process_subscriptions() is the async iterator
                 async for response in w3.socket.process_subscriptions():
                     if not state.monitoring:
                         await w3.eth.unsubscribe(subscription_id)
                         break
 
-                    # response IS the block header dict directly
-                    block_header = response
-                    block_number = block_header.get("number")
-                    if block_number is None:
+                    # FIX #1: web3.py v7 wraps the payload — extract "result" first,
+                    # then fall back to the response itself for compatibility.
+                    if isinstance(response, dict) and "result" in response:
+                        block_header = response["result"]
+                    else:
+                        block_header = response
+
+                    # block_number may arrive as int or hex string depending on provider
+                    raw_number = block_header.get("number")
+                    if raw_number is None:
+                        logger.debug("Received response with no block number, skipping: %s", response)
                         continue
 
+                    # Convert hex string to int if needed
+                    block_number = int(raw_number, 16) if isinstance(raw_number, str) else int(raw_number)
                     logger.info("New block: %d", block_number)
 
                     try:
@@ -168,12 +200,14 @@ async def monitor_blockchain(app: Application) -> None:
                         logger.warning("Could not fetch block %d: %s", block_number, e)
                         continue
 
-                    eth_price = fetch_eth_price()
+                    # FIX #2: await the now-async price fetch
+                    eth_price = await fetch_eth_price()
                     if eth_price == 0:
                         logger.warning("ETH price unavailable; skipping block %d.", block_number)
                         continue
 
                     state.blocks_scanned += 1
+                    logger.debug("Scanning %d transactions in block %d", len(block.transactions), block_number)
 
                     for tx in block.transactions:
                         try:
@@ -182,16 +216,18 @@ async def monitor_blockchain(app: Application) -> None:
 
                             if usd_value >= state.threshold_usd:
                                 alert_text = build_alert(tx, eth_amount, usd_value)
+                                # FIX #4: use link_preview_options instead of deprecated disable_web_page_preview
                                 await app.bot.send_message(
                                     chat_id=TELEGRAM_CHAT_ID,
                                     text=alert_text,
-                                    disable_web_page_preview=True,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True),
                                 )
                                 state.alerts_sent += 1
                                 tx_hash = tx["hash"].hex() if isinstance(tx["hash"], bytes) else tx["hash"]
                                 logger.info("Alert sent -- $%.2f | tx %s...", usd_value, tx_hash[:16])
                         except Exception as tx_err:
-                            logger.debug("Error processing tx: %s", tx_err)
+                            # FIX #3: raised to WARNING so errors are visible in logs
+                            logger.warning("Error processing tx: %s", tx_err)
 
         except asyncio.CancelledError:
             logger.info("Monitor task cancelled.")
@@ -219,7 +255,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state.monitor_task   = asyncio.create_task(monitor_blockchain(context.application))
 
     await update.message.reply_text(
-        f"Ethereum monitor started!\n"
+        f"✅ Ethereum monitor started!\n"
         f"Alert threshold: ${state.threshold_usd:,.0f} USD\n\n"
         f"Use /stop to halt.  Use /threshold to change the alert level."
     )
@@ -240,7 +276,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         state.monitor_task = None
 
-    await update.message.reply_text("Monitoring stopped.")
+    await update.message.reply_text("🛑 Monitoring stopped.")
     logger.info("Monitoring stopped by user %s.", update.effective_user.id)
 
 
@@ -257,22 +293,22 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if new_val <= 0:
             raise ValueError
         state.threshold_usd = new_val
-        await update.message.reply_text(f"Threshold updated to ${state.threshold_usd:,.0f} USD")
+        await update.message.reply_text(f"✅ Threshold updated to ${state.threshold_usd:,.0f} USD")
         logger.info("Threshold changed to $%.2f by user %s.", new_val, update.effective_user.id)
     except (ValueError, IndexError):
         await update.message.reply_text("Invalid value. Example: /threshold 10000")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    status   = "Running" if state.monitoring else "Stopped"
-    eth_price = fetch_eth_price()
-    uptime   = "--"
+    status    = "🟢 Running" if state.monitoring else "🔴 Stopped"
+    eth_price = fetch_eth_price_sync()
+    uptime    = "--"
     if state.monitoring and state.start_time:
         e = int(time.time() - state.start_time)
         uptime = f"{e//3600:02d}:{(e%3600)//60:02d}:{e%60:02d}"
 
     await update.message.reply_text(
-        f"Bot Status\n\n"
+        f"📊 Bot Status\n\n"
         f"Status:         {status}\n"
         f"Threshold:      ${state.threshold_usd:,.0f} USD\n"
         f"ETH Price:      ${eth_price:,.2f} USD\n"
