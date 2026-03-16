@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID: str   = os.getenv("TELEGRAM_CHAT_ID",   "6050518380")
 # Alchemy: wss://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 WEB3_WSS_ENDPOINT: str = os.getenv(
     "WEB3_WSS_ENDPOINT",
-    "wss://mainnet.infura.io/ws/v3/YOUR_INFURA_PROJECT_ID",
+    "wss://ethereum.publicnode.com",
 )
 
 # ── Alert Threshold ────────────────────────────────────────────────────────────
