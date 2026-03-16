@@ -5,7 +5,10 @@ Compatible with: web3>=7.0, python-telegram-bot>=21.5, Python 3.11+
 """
 
 import asyncio
+import atexit
 import logging
+import os
+import sys
 import time
 from decimal import Decimal
 from typing import Optional
@@ -41,6 +44,30 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("eth_monitor")
+
+
+# ── Single-Instance Lock ───────────────────────────────────────────────────────
+_LOCK_FILE = "/tmp/eth_monitor.lock"
+
+def _acquire_lock() -> None:
+    """Prevent multiple bot instances from running (causes Telegram 409 Conflict)."""
+    if os.path.exists(_LOCK_FILE):
+        try:
+            with open(_LOCK_FILE) as f:
+                old_pid = int(f.read().strip())
+            # Check if that PID is actually still alive
+            os.kill(old_pid, 0)
+            print(f"ERROR: Another instance is already running (PID {old_pid}).")
+            print("Run: pkill -f bot.py   then try again.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Stale lock file — previous run crashed without cleanup
+            os.remove(_LOCK_FILE)
+
+    with open(_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(_LOCK_FILE) and os.remove(_LOCK_FILE))
+    logger.info("Lock acquired (PID %d).", os.getpid())
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -270,6 +297,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
 def main() -> None:
+    _acquire_lock()
     logger.info("Starting Ethereum Monitor Bot...")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
