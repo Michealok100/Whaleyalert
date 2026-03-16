@@ -147,7 +147,7 @@ async def monitor_blockchain(app: Application) -> None:
                 reconnect_delay = 5  # reset on success
 
                 # Subscribe to new block headers
-                async for block_header in await w3.eth.subscribe("newHeads"):
+                async for block_header in w3.eth.subscribe("newHeads"):
                     if not state.monitoring:
                         break
 
